@@ -1,20 +1,39 @@
-import dotenv from 'dotenv';
 import fastify from 'fastify';
 import fastifyProxy from '@fastify/http-proxy';
 import fastifyCookie from '@fastify/cookie';
 import fastifyForm from '@fastify/formbody';
 import fs from 'fs';
 import { Static, Type } from '@sinclair/typebox';
-import totp from 'totp-generator';
+import speakeasy from 'speakeasy';
 import crypto from 'crypto';
+import qrcode from 'qrcode';
+import dotenv from 'dotenv';
 
 dotenv.config();
 
 const proxyTo = process.env.PROXY_TO;
-if (!proxyTo) throw new Error('Invalid proxyTo');
+if (!proxyTo || typeof proxyTo !== 'string') throw new Error('Invalid proxyTo');
 
 const sessionValidTime = Number(process.env.SESSION_VALID_TIME);
 if (isNaN(sessionValidTime) || sessionValidTime < 0) throw new Error('Invalid sessionValidTime');
+
+console.log('Reading config.json');
+if (!fs.existsSync('./config.json')) fs.writeFileSync('./config.json', '{}');
+const config = JSON.parse(fs.readFileSync('./config.json').toString('utf-8'));
+
+let generatedSecret: string | undefined;
+let otpSecret = config.otpSecret;
+
+if (!otpSecret) {
+    console.log('Generating TOTP secret now');
+    const secret = speakeasy.generateSecret();
+    config.otpSecret = otpSecret = secret.base32;
+    generatedSecret = secret.otpauth_url;
+}
+
+if (typeof otpSecret !== 'string') throw new Error('Invalid otpSecret');
+
+fs.writeFileSync('./config.json', JSON.stringify(config));
 
 interface Session {
     authDate: Date,
@@ -23,8 +42,8 @@ interface Session {
 
 const app = fastify();
 const sessionMap = new Map<string, Session>();
-const otpSecret = 'AAAAAAAAAAAAAAAA';
 const indexHtml = fs.readFileSync('./index.html').toString('utf-8');
+const qrHtml = fs.readFileSync('./qrcode.html').toString('utf-8');
 
 app.register(fastifyCookie);
 
@@ -54,6 +73,18 @@ app.register(async (fastify, done) => {
     fastify.register(fastifyForm);
 
     fastify.get('/', (req, res) => {
+        if (generatedSecret) {
+            console.log('Someone read OTP QR Code');
+            qrcode.toDataURL(generatedSecret, (err, dataUrl) => {
+                if (err) {
+                    res.status(400).send({message: 'Error while generating QR Code'});
+                    return;
+                }
+                res.type('text/html').send(qrHtml.replace('{PLACEHOLDER}', `src="${dataUrl}"`));
+            });
+            generatedSecret = '';
+            return;
+        }
         res.type('text/html').send(indexHtml);
     });
 
@@ -70,7 +101,7 @@ app.register(async (fastify, done) => {
             body: OTPSubmitBody
         }
     }, (req, res) => {
-        if (req.body.otp === totp(otpSecret)) {
+        if (speakeasy.totp.verify({ secret: otpSecret, encoding: 'base32', token: req.body.otp})) {
             const uuid = crypto.randomUUID();
             const session: Session = {
                 authDate: new Date(),
